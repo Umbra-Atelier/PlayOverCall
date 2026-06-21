@@ -1,0 +1,6 @@
+{
+  "name": "TelePlay",
+  "description": "A collection of asymmetric two-player co-op games designed to be played over a phone call, where only one person can see the screen.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
