@@ -1,6 +1,6 @@
 {
-  "name": "TelePlay",
-  "description": "A collection of asymmetric two-player co-op games designed to be played over a phone call, where only one person can see the screen.",
-  "requestFramePermissions": [],
+  "name": "Say The Word",
+  "description": "An interactive AI voice adventure. Put your friend on speakerphone, choose a setting, and use your voices to guide the narrator through a unique AI-generated story.",
+  "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
