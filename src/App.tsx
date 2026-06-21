@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, Play, Settings2, Sparkles, BookOpen, Skull, Rocket, AlertCircle, Phone } from 'lucide-react';
+import { Mic, BookOpen, Skull, Rocket, AlertCircle, Phone, Loader2, Volume2, Wifi, WifiOff, VolumeX, Sparkles } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
 
 const SETTINGS = [
   { id: 'haunted', title: 'Haunted Mansion', icon: Skull, color: 'text-rose-500', bg: 'bg-rose-500/10' },
@@ -8,138 +9,192 @@ const SETTINGS = [
   { id: 'fantasy', title: 'Fantasy Tavern', icon: BookOpen, color: 'text-amber-400', bg: 'bg-amber-500/10' },
 ];
 
+const LOADING_PHRASES = [
+  "Generating massive story universe...",
+  "Writing branching narratives...",
+  "Plotting dramatic twists...",
+  "Preparing for offline mode...",
+  "Almost there..."
+];
+
+interface Choice {
+  text: string;
+  keywords: string[];
+  nextNodeId: string;
+}
+
+interface StoryNode {
+  id: string;
+  text: string;
+  isEnding: boolean;
+  choices?: Choice[];
+}
+
+interface StoryTree {
+  title: string;
+  nodes: StoryNode[];
+}
+
 export default function App() {
-  const [gameState, setGameState] = useState<'menu' | 'playing'>('menu');
+  const [gameState, setGameState] = useState<'menu' | 'loading' | 'playing'>('menu');
   const [selectedSetting, setSelectedSetting] = useState(SETTINGS[0]);
   const [error, setError] = useState<string | null>(null);
-  const [isConnected, setIsConnected] = useState(false);
   
-  // Refs to avoid stale closures
-  const wsRef = useRef<WebSocket | null>(null);
-  const inputAudioCtxRef = useRef<AudioContext | null>(null);
-  const outputAudioCtxRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const nextStartTimeRef = useRef(0);
+  const [storyData, setStoryData] = useState<StoryTree | null>(null);
+  const [currentNodeId, setCurrentNodeId] = useState<string>('start');
+  
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [lastHeard, setLastHeard] = useState('');
+  const [loadingPhraseIndex, setLoadingPhraseIndex] = useState(0);
+
+  const recognitionRef = useRef<any>(null);
+
+  useEffect(() => {
+    const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRec) {
+      const rec = new SpeechRec();
+      rec.lang = 'en-US';
+      rec.continuous = false;
+      rec.interimResults = false;
+      
+      rec.onstart = () => setIsListening(true);
+      rec.onend = () => setIsListening(false);
+      rec.onresult = (e: any) => {
+        const transcript = e.results[0][0].transcript.toLowerCase();
+        setLastHeard(transcript);
+
+        // Process Choice
+        setStoryData((prevData) => {
+          if (!prevData) return prevData;
+          setCurrentNodeId((prevId) => {
+            const node = prevData.nodes.find(n => n.id === prevId);
+            if (node && node.choices) {
+              for (let i = 0; i < node.choices.length; i++) {
+                const choice = node.choices[i];
+                const matchers = [
+                  ...choice.keywords.map(k => k.toLowerCase()),
+                  `option ${i + 1}`,
+                  `option number ${i + 1}`,
+                  `${i + 1}`,
+                  choice.text.toLowerCase()
+                ];
+                if (matchers.some(m => transcript.includes(m))) {
+                  return choice.nextNodeId; // Return new ID
+                }
+              }
+            }
+            // Did not match, restart listening soon if intended
+            return prevId;
+          });
+          return prevData;
+        });
+      };
+      recognitionRef.current = rec;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (gameState === 'loading') {
+      const interval = setInterval(() => {
+        setLoadingPhraseIndex(i => (i + 1) % LOADING_PHRASES.length);
+      }, 4000);
+      return () => clearInterval(interval);
+    }
+  }, [gameState]);
 
   const startGame = async () => {
+    // Unlock speech synthesis eagerly on user interaction
+    window.speechSynthesis.cancel();
+    const silent = new SpeechSynthesisUtterance('');
+    silent.volume = 0;
+    window.speechSynthesis.speak(silent);
+
+    setGameState('loading');
     setError(null);
+
     try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error("Microphone API not available. Ensure you are using HTTPS.");
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${location.host}/live`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      const inputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      inputAudioCtxRef.current = inputAudioCtx;
+      const res = await fetch('/api/generate-story', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ setting: selectedSetting.title })
+      });
+      if (!res.ok) throw new Error('Failed to fetch the story from the server.');
       
-      const outputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      outputAudioCtxRef.current = outputAudioCtx;
-
-      const source = inputAudioCtx.createMediaStreamSource(stream);
-      const processor = inputAudioCtx.createScriptProcessor(4096, 1, 1);
-      source.connect(processor);
-      processor.connect(inputAudioCtx.destination);
-
-      processor.onaudioprocess = (e) => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
-        ws.send(JSON.stringify({ type: 'audio', audio: base64 }));
-      };
-
-      ws.onopen = () => {
-        setIsConnected(true);
-        ws.send(JSON.stringify({ type: 'start', setting: selectedSetting.title }));
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'audio' && msg.audio) {
-             playAudioChunk(outputAudioCtx, msg.audio);
-          } else if (msg.type === 'interrupted') {
-             // If model is interrupted, clear queued playback
-             nextStartTimeRef.current = outputAudioCtx.currentTime;
-          }
-        } catch (e) {
-          console.error("Failed parsing WS message", e);
-        }
-      };
-
-      ws.onclose = () => {
-        setIsConnected(false);
-      };
-
-      ws.onerror = (e) => {
-        console.error("WebSocket error", e);
-        setError("Connection failed. Ensure the backend server is running.");
-        stopGame();
-      };
-
+      const data = await res.json();
+      if (!data || !data.nodes || data.nodes.length === 0) {
+        throw new Error('Received an empty story from the server.');
+      }
+      
+      setStoryData(data);
+      setCurrentNodeId('start');
       setGameState('playing');
     } catch (err: any) {
-      setError("Microphone access denied or error: " + err.message);
+      setError(err.message + " (Check if the server is running).");
+      setGameState('menu');
     }
   };
 
-  const pcmToBase64 = (float32Array: Float32Array) => {
-    const buffer = new ArrayBuffer(float32Array.length * 2);
-    const view = new DataView(buffer);
-    for (let i = 0; i < float32Array.length; i++) {
-      let s = Math.max(-1, Math.min(1, float32Array[i]));
-      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-    }
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    for (let i = 0; i < bytes.byteLength; i += 1024) {
-      binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 1024)));
-    }
-    return btoa(binary);
+  const handleChoiceClick = (nextId: string) => {
+    window.speechSynthesis.cancel();
+    if (isListening && recognitionRef.current) recognitionRef.current.abort();
+    setIsSpeaking(false);
+    setLastHeard('');
+    setCurrentNodeId(nextId);
   };
 
-  const playAudioChunk = (ctx: AudioContext, base64: string) => {
-    const binary = atob(base64);
-    const buffer = new Float32Array(binary.length / 2);
-    const dataView = new DataView(new ArrayBuffer(binary.length));
-    
-    for (let i = 0; i < binary.length; i++) {
-        dataView.setUint8(i, binary.charCodeAt(i));
+  const manuallyStartListening = () => {
+    if (recognitionRef.current) {
+      try { recognitionRef.current.start(); } catch (e) {}
     }
-    for (let i = 0; i < buffer.length; i++) {
-        buffer[i] = dataView.getInt16(i * 2, true) / 32768;
-    }
-
-    const audioBuffer = ctx.createBuffer(1, buffer.length, 24000);
-    audioBuffer.getChannelData(0).set(buffer);
-
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(ctx.destination);
-
-    if (nextStartTimeRef.current < ctx.currentTime) {
-       nextStartTimeRef.current = ctx.currentTime + 0.1;
-    }
-    source.start(nextStartTimeRef.current);
-    nextStartTimeRef.current += audioBuffer.duration;
   };
 
   const stopGame = () => {
-    if (wsRef.current) wsRef.current.close();
-    if (inputAudioCtxRef.current) inputAudioCtxRef.current.close();
-    if (outputAudioCtxRef.current) outputAudioCtxRef.current.close();
-    if (streamRef.current) streamRef.current.getTracks().forEach((track) => track.stop());
+    window.speechSynthesis.cancel();
+    if (isListening && recognitionRef.current) recognitionRef.current.abort();
     setGameState('menu');
+    setStoryData(null);
   };
+
+  const currentNode = storyData?.nodes.find(n => n.id === currentNodeId);
+
+  useEffect(() => {
+    if (gameState === 'playing' && currentNode) {
+      window.speechSynthesis.cancel();
+      setLastHeard('');
+      
+      let fullText = currentNode.text;
+      if (!currentNode.isEnding && currentNode.choices) {
+        const choiceText = currentNode.choices.map((c, i) => `Option ${i + 1}... ${c.text}`).join('. ');
+        fullText += `. What will you do? ${choiceText}`;
+      }
+      
+      const utterance = new SpeechSynthesisUtterance(fullText);
+      utterance.onstart = () => setIsSpeaking(true);
+      utterance.onend = () => {
+        setIsSpeaking(false);
+        if (!currentNode.isEnding) {
+          manuallyStartListening();
+        }
+      };
+      utterance.onerror = () => setIsSpeaking(false);
+      
+      // Delay slightly so UI transition can complete
+      const timer = setTimeout(() => {
+        window.speechSynthesis.speak(utterance);
+      }, 500);
+
+      return () => {
+        clearTimeout(timer);
+        window.speechSynthesis.cancel();
+      };
+    }
+  }, [currentNodeId, gameState]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans p-4 md:p-8">
-      {gameState === 'menu' ? (
+      
+      {gameState === 'menu' && (
         <div className="max-w-4xl mx-auto w-full pt-10">
           <header className="mb-12">
             <h1 className="text-4xl md:text-5xl font-black mb-4 tracking-tight drop-shadow-sm flex items-center gap-3 text-white">
@@ -149,11 +204,11 @@ export default function App() {
               Say The Word
             </h1>
             <p className="text-xl text-slate-400 leading-relaxed max-w-2xl">
-              An interactive AI story game. Call your friend on speakerphone, choose a setting, and control the adventure entirely with your voices.
+              An interactive offline-ready AI story game. Call a friend, generate a giant story tree, and then go completely offline. Guide the narrator entirely with your voice.
             </p>
           </header>
 
-          <h2 className="text-2xl font-bold mb-6 text-slate-300">Choose your starting setting</h2>
+          <h2 className="text-2xl font-bold mb-6 text-slate-300">Choose your setting</h2>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-10">
             {SETTINGS.map((setting) => (
               <button
@@ -169,7 +224,7 @@ export default function App() {
                   <setting.icon className="w-8 h-8" />
                 </div>
                 <h3 className="text-xl font-bold text-white mb-2">{setting.title}</h3>
-                <p className="text-slate-400 text-sm">Start an adventure in a {setting.title.toLowerCase()}.</p>
+                <p className="text-slate-400 text-sm">Download an adventure in a {setting.title.toLowerCase()}.</p>
               </button>
             ))}
           </div>
@@ -186,40 +241,142 @@ export default function App() {
               onClick={startGame}
               className="flex items-center gap-3 bg-indigo-600 hover:bg-indigo-500 text-white px-12 py-5 rounded-full font-bold text-xl transition-all hover:-translate-y-1 active:translate-y-0 shadow-lg shadow-indigo-600/30"
             >
-              <Phone className="w-6 h-6" /> Start Voice Session
+              <Wifi className="w-6 h-6" /> Generate & Download Story
             </button>
           </div>
         </div>
-      ) : (
-        <div className="max-w-2xl mx-auto w-full flex-1 flex flex-col items-center justify-center text-center animate-in fade-in duration-1000">
-           <div className={`relative w-48 h-48 rounded-full border border-slate-800 bg-slate-900 flex items-center justify-center mb-8 transition-all duration-500 ${isConnected ? 'shadow-[0_0_60px_rgba(99,102,241,0.2)] border-indigo-500/50' : ''}`}>
-              <Mic className={`w-16 h-16 transition-colors duration-500 ${isConnected ? 'text-indigo-400' : 'text-slate-600'}`} />
-              
-              {isConnected && (
-                <>
-                  <div className="absolute inset-0 rounded-full border border-indigo-500/30 animate-[ping_2s_cubic-bezier(0,0,0.2,1)_infinite]" />
-                  <div className="absolute inset-0 rounded-full border border-indigo-500/20 animate-[ping_3s_cubic-bezier(0,0,0.2,1)_infinite_1s]" />
-                </>
+      )}
+
+      {gameState === 'loading' && (
+        <div className="flex-1 flex flex-col items-center justify-center text-center animate-in fade-in duration-500">
+           <div className="relative mb-10">
+              <div className="absolute inset-0 border-4 border-indigo-500/20 rounded-full animate-ping" />
+              <div className="bg-indigo-500/10 p-8 rounded-full border border-indigo-500/30">
+                 <Loader2 className="w-16 h-16 text-indigo-400 animate-spin" />
+              </div>
+           </div>
+           <h2 className="text-3xl font-black text-white mb-4 tracking-tight drop-shadow-md">
+             {LOADING_PHRASES[loadingPhraseIndex]}
+           </h2>
+           <p className="text-slate-400 max-w-md mx-auto">
+             We are building a massive branching story tree for you. Once this finishes, you can disconnect from the internet and keep playing.
+           </p>
+        </div>
+      )}
+
+      {gameState === 'playing' && currentNode && (
+        <div className="max-w-3xl mx-auto w-full flex-1 flex flex-col animate-in slide-in-from-bottom-8 duration-700">
+           
+           <header className="flex items-center justify-between py-6 border-b border-slate-800 mb-8">
+              <div className="flex items-center gap-3">
+                 <div className="bg-green-500/10 text-green-400 px-3 py-1.5 rounded-full text-xs font-bold uppercase tracking-widest flex items-center gap-2 border border-green-500/30">
+                    <WifiOff className="w-4 h-4" /> Offline Ready
+                 </div>
+                 <span className="text-slate-500 font-medium">|</span>
+                 <span className="text-slate-400 font-bold">{storyData?.title || selectedSetting.title}</span>
+              </div>
+              <button onClick={stopGame} className="text-slate-500 hover:text-white transition-colors text-sm font-bold uppercase tracking-wider">
+                End Story
+              </button>
+           </header>
+
+           <div className="flex-1 flex flex-col justify-center">
+              <AnimatePresence mode="wait">
+                <motion.div 
+                  key={currentNode.id}
+                  initial={{ opacity: 0, y: 15 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -15 }}
+                  transition={{ duration: 0.4 }}
+                  className="mb-10"
+                >
+                  <p className="text-2xl md:text-3xl font-serif leading-relaxed text-slate-200">
+                    {currentNode.text}
+                  </p>
+                </motion.div>
+              </AnimatePresence>
+
+              {!currentNode.isEnding && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-8">
+                  {currentNode.choices?.map((choice, i) => (
+                    <button 
+                      key={i}
+                      onClick={() => handleChoiceClick(choice.nextNodeId)}
+                      className="group relative bg-slate-900 border border-slate-700 hover:border-indigo-500 hover:bg-slate-800 p-6 rounded-3xl text-left transition-all active:scale-[0.98]"
+                    >
+                       <div className="text-indigo-400 text-sm font-bold uppercase tracking-widest mb-2 flex items-center gap-2">
+                          <span className="bg-slate-800 px-2 py-1 rounded-md text-white">Option {i + 1}</span>
+                       </div>
+                       <p className="text-lg font-medium text-white mb-4 group-hover:text-indigo-200 transition-colors">
+                         {choice.text}
+                       </p>
+                       <div className="flex flex-wrap gap-2">
+                          {choice.keywords.slice(0, 3).map(kw => (
+                            <span key={kw} className="text-xs bg-slate-800 text-slate-400 px-2 py-1 rounded-full border border-slate-700">
+                               "{kw}"
+                            </span>
+                          ))}
+                       </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {currentNode.isEnding && (
+                <div className="mt-12 text-center">
+                   <h3 className="text-2xl font-black text-rose-400 mb-6 uppercase tracking-[0.2em]">The End</h3>
+                   <button 
+                     onClick={stopGame}
+                     className="bg-slate-800 border border-slate-700 hover:bg-slate-700 text-white px-8 py-4 rounded-full font-bold transition-all shadow-lg"
+                   >
+                     Read Another Story
+                   </button>
+                </div>
               )}
            </div>
 
-           <h2 className="text-3xl font-black text-white mb-2 tracking-tight">
-             {isConnected ? `Exploring: ${selectedSetting.title}` : 'Connecting...'}
-           </h2>
-           <p className="text-slate-400 mb-12">
-             {isConnected 
-               ? "Put your friend on speakerphone. Listen to the storyteller and reply with your voice."
-               : "Establishing telepathic link to the storyteller..."}
-           </p>
+           {/* Voice Status Bar */}
+           <div className="fixed bottom-0 left-0 right-0 p-6 pointer-events-none">
+              <div className="max-w-3xl mx-auto flex items-center gap-4 bg-slate-900/90 backdrop-blur-md p-4 rounded-2xl border border-slate-800 shadow-2xl pointer-events-auto">
+                 {isSpeaking ? (
+                   <div className="flex items-center gap-3 text-indigo-400 font-bold">
+                     <Volume2 className="w-6 h-6 animate-pulse" />
+                     Reading aloud...
+                   </div>
+                 ) : isListening ? (
+                   <div className="flex items-center gap-3 text-green-400 font-bold bg-green-500/10 px-4 py-2 rounded-xl">
+                     <Mic className="w-5 h-5 animate-pulse" />
+                     Say your choice...
+                   </div>
+                 ) : (
+                   <button 
+                     onClick={manuallyStartListening}
+                     className="flex items-center gap-3 text-slate-400 hover:text-white transition-colors"
+                   >
+                     <Mic className="w-5 h-5" />
+                     <span className="font-medium text-sm">Tap mic if it stopped listening</span>
+                   </button>
+                 )}
 
-           <button 
-             onClick={stopGame}
-             className="px-8 py-4 rounded-full border-2 border-slate-800 text-slate-300 hover:bg-rose-500/10 hover:text-rose-400 hover:border-rose-500/50 transition-colors font-bold tracking-wide"
-           >
-             End Adventure
-           </button>
+                 {lastHeard && (
+                   <div className="ml-auto text-sm text-slate-500 font-mono flex items-center">
+                      Heard: <span className="text-slate-300 ml-2">"{lastHeard}"</span>
+                   </div>
+                 )}
+
+                 <button 
+                   onClick={() => window.speechSynthesis.cancel()} 
+                   className="ml-auto bg-slate-800 p-2 rounded-xl text-slate-400 hover:text-white hover:bg-rose-500/20 hover:text-rose-400 transition-colors"
+                   title="Stop Audio"
+                 >
+                   <VolumeX className="w-5 h-5" />
+                 </button>
+              </div>
+           </div>
+
         </div>
       )}
+
     </div>
   );
 }
