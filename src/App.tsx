@@ -24,6 +24,10 @@ export default function App() {
   const startGame = async () => {
     setError(null);
     try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("Microphone API not available. Ensure you are using HTTPS.");
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
@@ -70,6 +74,12 @@ export default function App() {
 
       ws.onclose = () => {
         setIsConnected(false);
+      };
+
+      ws.onerror = (e) => {
+        console.error("WebSocket error", e);
+        setError("Connection failed. Ensure the backend server is running.");
+        stopGame();
       };
 
       setGameState('playing');
