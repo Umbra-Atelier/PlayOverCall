@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, BookOpen, Skull, Rocket, AlertCircle, Phone, Loader2, Volume2, Wifi, WifiOff, VolumeX, Sparkles } from 'lucide-react';
+import { Mic, BookOpen, Skull, Rocket, AlertCircle, Phone, Loader2, Volume2, Wifi, WifiOff, VolumeX, Sparkles, Key } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { GoogleGenAI, Type } from '@google/genai';
 
 const SETTINGS = [
   { id: 'haunted', title: 'Haunted Mansion', icon: Skull, color: 'text-rose-500', bg: 'bg-rose-500/10' },
@@ -36,6 +37,9 @@ interface StoryTree {
 }
 
 export default function App() {
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
+  const [showApiInput, setShowApiInput] = useState(!localStorage.getItem('gemini_api_key'));
+
   const [gameState, setGameState] = useState<'menu' | 'loading' | 'playing'>('menu');
   const [selectedSetting, setSelectedSetting] = useState(SETTINGS[0]);
   const [error, setError] = useState<string | null>(null);
@@ -104,6 +108,14 @@ export default function App() {
   }, [gameState]);
 
   const startGame = async () => {
+    if (!apiKey) {
+      setError("Please enter a Gemini API key to generate the story.");
+      setShowApiInput(true);
+      return;
+    }
+
+    localStorage.setItem('gemini_api_key', apiKey);
+
     // Unlock speech synthesis eagerly on user interaction
     window.speechSynthesis.cancel();
     const silent = new SpeechSynthesisUtterance('');
@@ -114,31 +126,67 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await fetch('/api/generate-story', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ setting: selectedSetting.title })
+      const ai = new GoogleGenAI({
+        apiKey: apiKey,
+        // Since we are running in the browser, we need to bypass any potential browser checks if applicable, 
+        // though @google/genai typically supports browsers. If there are CORS issues, the user must use a valid key or we can handle it.
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.details || data.error || 'Failed to fetch the story from the server.');
-      }
-      
-      const data = await res.json();
-      // Wait, if it failed but we streamed 200 OK, the body contains { error: "..." }
-      if (data.error) {
-        throw new Error(data.details || data.error);
-      }
+
+      const prompt = `You are an AI storyteller creating a voice-based offline "Choose Your Own Adventure" game.
+      Create a detailed, immersive branching story tree for the setting: "${selectedSetting.title}".
+      To ensure fast loading while still providing offline playability, generate exactly 8-12 total nodes in the tree.
+      The root node MUST have id "start".
+      Ensure valid 'nextNodeId' references for all choices.
+      Make the narrative text highly atmospheric and engaging (about 30-50 words per node).
+      For leaf nodes (endings), ensure 'isEnding' is true.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              title: { type: Type.STRING },
+              nodes: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    text: { type: Type.STRING, description: "Detailed narrative text." },
+                    isEnding: { type: Type.BOOLEAN },
+                    choices: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          text: { type: Type.STRING, description: "The choice summary presented to the player." },
+                          keywords: { type: Type.ARRAY, items: { type: Type.STRING }, description: "One-word keywords players might say to select this option." },
+                          nextNodeId: { type: Type.STRING }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+
+      const data = JSON.parse(response.text || "{}");
       
       if (!data || !data.nodes || data.nodes.length === 0) {
-        throw new Error('Received an empty story from the server.');
+        throw new Error('Received an empty story from the AI.');
       }
       
       setStoryData(data);
       setCurrentNodeId('start');
       setGameState('playing');
     } catch (err: any) {
-      setError(err.message + " (Check if the server is running).");
+      setError(err.message + " (Check your API key or network connection).");
       setGameState('menu');
     }
   };
@@ -235,6 +283,37 @@ export default function App() {
                 <p className="text-slate-400 text-sm">Download an adventure in a {setting.title.toLowerCase()}.</p>
               </button>
             ))}
+          </div>
+
+          <div className="mb-10">
+            <button 
+              onClick={() => setShowApiInput(!showApiInput)}
+              className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors mb-4"
+            >
+              <Key className="w-4 h-4" /> 
+              {showApiInput ? "Hide API Key Settings" : "Configure API Key"}
+            </button>
+            
+            <AnimatePresence>
+              {showApiInput && (
+                <motion.div 
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="bg-slate-900 border border-slate-800 p-6 rounded-3xl overflow-hidden"
+                >
+                  <label className="block text-sm font-bold text-slate-300 mb-2">Gemini API Key</label>
+                  <p className="text-sm text-slate-500 mb-4">Required to generate the story offline tree. Stored locally in your browser.</p>
+                  <input
+                    type="password"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder="AIzaSy..."
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all"
+                  />
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
 
           {error && (
