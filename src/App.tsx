@@ -119,9 +119,17 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ setting: selectedSetting.title })
       });
-      if (!res.ok) throw new Error('Failed to fetch the story from the server.');
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.details || data.error || 'Failed to fetch the story from the server.');
+      }
       
       const data = await res.json();
+      // Wait, if it failed but we streamed 200 OK, the body contains { error: "..." }
+      if (data.error) {
+        throw new Error(data.details || data.error);
+      }
+      
       if (!data || !data.nodes || data.nodes.length === 0) {
         throw new Error('Received an empty story from the server.');
       }

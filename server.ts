@@ -21,18 +21,26 @@ async function startServer() {
   });
 
   app.post("/api/generate-story", async (req, res) => {
+    // Prevent 60s proxy timeout by sending a whitespace character every 5 seconds
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    
+    const keepAlive = setInterval(() => {
+      res.write(' '); // JSON.parse ignores leading whitespace
+    }, 5000);
+
     try {
       const { setting } = req.body;
       const prompt = `You are an AI storyteller creating a voice-based offline "Choose Your Own Adventure" game.
       Create a detailed, immersive branching story tree for the setting: "${setting}".
-      The story must be deep enough to last about 15-20 minutes of reading aloud (generate around 12-16 total nodes in the tree).
+      To ensure fast loading while still providing offline playability, generate exactly 8-12 total nodes in the tree.
       The root node MUST have id "start".
       Ensure valid 'nextNodeId' references for all choices.
-      Make the narrative text highly atmospheric and engaging (about 50-100 words per node).
+      Make the narrative text highly atmospheric and engaging (about 30-50 words per node).
       For leaf nodes (endings), ensure 'isEnding' is true.`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: "gemini-3.5-flash",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -67,11 +75,16 @@ async function startServer() {
         }
       });
 
-      const responseText = response.text();
-      res.json(JSON.parse(responseText || "{}"));
-    } catch (error) {
+      clearInterval(keepAlive);
+      const responseText = response.text || "{}";
+      res.write(responseText);
+      res.end();
+    } catch (error: any) {
+      clearInterval(keepAlive);
       console.error("Story generation failed:", error);
-      res.status(500).json({ error: "Failed to generate story tree." });
+      // Even though headers are sent, we just append an error property
+      res.write(JSON.stringify({ error: "Failed to generate story tree.", details: error.message }));
+      res.end();
     }
   });
 
