@@ -40,7 +40,13 @@ export default function App() {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
   const [showApiInput, setShowApiInput] = useState(!localStorage.getItem('gemini_api_key'));
 
-  const [gameState, setGameState] = useState<'menu' | 'loading' | 'playing'>('menu');
+  type GenerationSize = 1 | 2 | 5;
+  const [generationSize, setGenerationSize] = useState<GenerationSize>(2);
+  const [decisionCount, setDecisionCount] = useState(0);
+  const [storyHistory, setStoryHistory] = useState<string[]>([]);
+  const [pendingChoice, setPendingChoice] = useState<{ nextId: string, actionText: string } | null>(null);
+
+  const [gameState, setGameState] = useState<'menu' | 'loading' | 'playing' | 'generate_more'>('menu');
   const [selectedSetting, setSelectedSetting] = useState(SETTINGS[0]);
   const [error, setError] = useState<string | null>(null);
   
@@ -54,6 +60,12 @@ export default function App() {
 
   const recognitionRef = useRef<any>(null);
 
+  const getMaxDecisions = (size: GenerationSize) => {
+    if (size === 1) return 2;
+    if (size === 2) return 4;
+    return 8;
+  };
+
   useEffect(() => {
     const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (SpeechRec) {
@@ -64,39 +76,38 @@ export default function App() {
       
       rec.onstart = () => setIsListening(true);
       rec.onend = () => setIsListening(false);
-      rec.onresult = (e: any) => {
-        const transcript = e.results[0][0].transcript.toLowerCase();
-        setLastHeard(transcript);
-
-        // Process Choice
-        setStoryData((prevData) => {
-          if (!prevData) return prevData;
-          setCurrentNodeId((prevId) => {
-            const node = prevData.nodes.find(n => n.id === prevId);
-            if (node && node.choices) {
-              for (let i = 0; i < node.choices.length; i++) {
-                const choice = node.choices[i];
-                const matchers = [
-                  ...choice.keywords.map(k => k.toLowerCase()),
-                  `option ${i + 1}`,
-                  `option number ${i + 1}`,
-                  `${i + 1}`,
-                  choice.text.toLowerCase()
-                ];
-                if (matchers.some(m => transcript.includes(m))) {
-                  return choice.nextNodeId; // Return new ID
-                }
-              }
-            }
-            // Did not match, restart listening soon if intended
-            return prevId;
-          });
-          return prevData;
-        });
-      };
       recognitionRef.current = rec;
     }
   }, []);
+
+  useEffect(() => {
+    if (recognitionRef.current) {
+      recognitionRef.current.onresult = (e: any) => {
+        const transcript = e.results[0][0].transcript.toLowerCase();
+        setLastHeard(transcript);
+
+        if (gameState !== 'playing') return;
+
+        const node = storyData?.nodes.find(n => n.id === currentNodeId);
+        if (node && node.choices) {
+          for (let i = 0; i < node.choices.length; i++) {
+            const choice = node.choices[i];
+            const matchers = [
+              ...choice.keywords.map(k => k.toLowerCase()),
+              `option ${i + 1}`,
+              `option number ${i + 1}`,
+              `${i + 1}`,
+              choice.text.toLowerCase()
+            ];
+            if (matchers.some(m => transcript.includes(m))) {
+              handleChoiceClick(choice.nextNodeId, choice.text);
+              return;
+            }
+          }
+        }
+      };
+    }
+  });
 
   useEffect(() => {
     if (gameState === 'loading') {
@@ -107,7 +118,7 @@ export default function App() {
     }
   }, [gameState]);
 
-  const startGame = async () => {
+  const generateStory = async (isContinue: boolean = false) => {
     if (!apiKey) {
       setError("Please enter a Gemini API key to generate the story.");
       setShowApiInput(true);
@@ -124,79 +135,142 @@ export default function App() {
 
     setGameState('loading');
     setError(null);
+    setLoadingPhraseIndex(0);
 
     try {
       const ai = new GoogleGenAI({
         apiKey: apiKey,
-        // Since we are running in the browser, we need to bypass any potential browser checks if applicable, 
-        // though @google/genai typically supports browsers. If there are CORS issues, the user must use a valid key or we can handle it.
       });
 
-      const prompt = `You are an AI storyteller creating a voice-based offline "Choose Your Own Adventure" game.
-      Create a detailed, immersive branching story tree for the setting: "${selectedSetting.title}".
-      To ensure fast loading while still providing offline playability, generate exactly 8-12 total nodes in the tree.
-      The root node MUST have id "start".
-      Ensure valid 'nextNodeId' references for all choices.
-      Make the narrative text highly atmospheric and engaging (about 30-50 words per node).
-      For leaf nodes (endings), ensure 'isEnding' is true.`;
+      const nodeCountStr = generationSize === 1 ? "4-6" : generationSize === 2 ? "8-12" : "15-20";
+
+      let prompt = "";
+      if (!isContinue) {
+        prompt = `You are an AI storyteller creating a voice-based offline "Choose Your Own Adventure" game.
+        Setting: "${selectedSetting.title}".
+        Generate exactly ${nodeCountStr} total nodes in the tree.
+        The root node MUST have id "start".
+        Ensure valid 'nextNodeId' references for all choices.
+        Make the narrative text highly atmospheric and engaging (about 30-50 words per node).
+        For leaf nodes in this batch, DO NOT set 'isEnding' to true unless the story logically concludes. Instead, provide choices where the 'nextNodeId' points to a unique ID that you DO NOT generate in this batch (these will act as cliffhangers for future generation).
+        
+        OUTPUT FORMAT:
+        You must output valid JSON in this exact structure:
+        {
+          "title": "Story Title",
+          "nodes": [
+            {
+              "id": "start",
+              "text": "Narrative text here...",
+              "isEnding": false,
+              "choices": [
+                {
+                  "text": "Go left",
+                  "keywords": ["left", "go left"],
+                  "nextNodeId": "node_2"
+                }
+              ]
+            }
+          ]
+        }`;
+      } else {
+        const historyText = storyHistory.slice(-4).join(' ');
+        prompt = `You are an AI storyteller continuing a voice-based offline "Choose Your Own Adventure" game.
+        Previous story context: "${historyText}"
+        The player chose to: "${pendingChoice?.actionText}"
+        
+        Generate exactly ${nodeCountStr} new nodes to continue the story from this exact point.
+        The root node of this new batch MUST have id "${pendingChoice?.nextId}".
+        Ensure valid 'nextNodeId' references for choices.
+        Make the narrative text highly atmospheric and engaging (about 30-50 words per node).
+        For leaf nodes in this batch, DO NOT set 'isEnding' to true unless the story logically concludes. Instead, provide choices where the 'nextNodeId' points to a unique ID that you DO NOT generate in this batch.
+        
+        OUTPUT FORMAT:
+        You must output valid JSON in this exact structure:
+        {
+          "title": "Story Title",
+          "nodes": [
+            {
+              "id": "...",
+              "text": "Narrative text here...",
+              "isEnding": false,
+              "choices": [
+                {
+                  "text": "Go left",
+                  "keywords": ["left", "go left"],
+                  "nextNodeId": "node_X"
+                }
+              ]
+            }
+          ]
+        }`;
+      }
 
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash",
         contents: prompt,
         config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              nodes: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    text: { type: Type.STRING, description: "Detailed narrative text." },
-                    isEnding: { type: Type.BOOLEAN },
-                    choices: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          text: { type: Type.STRING, description: "The choice summary presented to the player." },
-                          keywords: { type: Type.ARRAY, items: { type: Type.STRING }, description: "One-word keywords players might say to select this option." },
-                          nextNodeId: { type: Type.STRING }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
+          responseMimeType: "application/json"
         }
       });
 
-      const data = JSON.parse(response.text || "{}");
+      const responseText = response.text;
+      if (!responseText) {
+          throw new Error('The AI returned an empty response (possibly blocked by safety filters).');
+      }
+
+      const data = JSON.parse(responseText);
       
       if (!data || !data.nodes || data.nodes.length === 0) {
-        throw new Error('Received an empty story from the AI.');
+        console.error("AI returned invalid structure:", data);
+        throw new Error('The AI did not return any story nodes. Raw output logged to console.');
       }
       
-      setStoryData(data);
-      setCurrentNodeId('start');
+      setStoryData(prev => {
+         if (!isContinue || !prev) return data;
+         const existingIds = new Set(data.nodes.map((n: any) => n.id));
+         const filteredPrevNodes = prev.nodes.filter(n => !existingIds.has(n.id));
+         return {
+            ...prev,
+            nodes: [...filteredPrevNodes, ...data.nodes]
+         };
+      });
+
+      if (!isContinue) {
+         setCurrentNodeId('start');
+         setStoryHistory([]);
+      } else if (pendingChoice) {
+         setCurrentNodeId(pendingChoice.nextId);
+      }
+      
+      setDecisionCount(0);
+      setPendingChoice(null);
       setGameState('playing');
     } catch (err: any) {
       setError(err.message + " (Check your API key or network connection).");
-      setGameState('menu');
+      setGameState(isContinue ? 'generate_more' : 'menu');
     }
   };
 
-  const handleChoiceClick = (nextId: string) => {
+  const handleChoiceClick = (nextId: string, actionText: string) => {
     window.speechSynthesis.cancel();
     if (isListening && recognitionRef.current) recognitionRef.current.abort();
     setIsSpeaking(false);
     setLastHeard('');
-    setCurrentNodeId(nextId);
+    
+    if (currentNode) {
+      setStoryHistory(prev => [...prev, currentNode.text]);
+    }
+
+    const nextNodeExists = storyData?.nodes.some(n => n.id === nextId);
+    
+    if (decisionCount + 1 >= getMaxDecisions(generationSize) || !nextNodeExists) {
+      setPendingChoice({ nextId, actionText });
+      setGameState('generate_more');
+    } else {
+      setDecisionCount(prev => prev + 1);
+      setCurrentNodeId(nextId);
+    }
   };
 
   const manuallyStartListening = () => {
@@ -286,6 +360,24 @@ export default function App() {
           </div>
 
           <div className="mb-10">
+            <h3 className="text-xl font-bold text-slate-300 mb-4">Select Offline Generation Buffer</h3>
+            <div className="flex flex-wrap gap-4 mb-6">
+              {[1, 2, 5].map(size => (
+                <button
+                  key={size}
+                  onClick={() => setGenerationSize(size as GenerationSize)}
+                  className={`px-6 py-4 rounded-2xl border-2 font-bold transition-all flex-1 text-center ${
+                    generationSize === size
+                      ? 'border-indigo-500 bg-indigo-500/20 text-indigo-300 shadow-[0_0_15px_rgba(99,102,241,0.2)]'
+                      : 'border-slate-800 bg-slate-900 text-slate-400 hover:bg-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="text-2xl mb-1">{size}</div>
+                  <div className="text-xs uppercase tracking-wider opacity-80">Minute{size > 1 ? 's' : ''} Playtime</div>
+                </button>
+              ))}
+            </div>
+
             <button 
               onClick={() => setShowApiInput(!showApiInput)}
               className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors mb-4"
@@ -325,7 +417,7 @@ export default function App() {
 
           <div className="flex justify-center">
             <button
-              onClick={startGame}
+              onClick={() => generateStory(false)}
               className="flex items-center gap-3 bg-indigo-600 hover:bg-indigo-500 text-white px-12 py-5 rounded-full font-bold text-xl transition-all hover:-translate-y-1 active:translate-y-0 shadow-lg shadow-indigo-600/30"
             >
               <Wifi className="w-6 h-6" /> Generate & Download Story
@@ -351,20 +443,82 @@ export default function App() {
         </div>
       )}
 
+      {gameState === 'generate_more' && (
+        <div className="flex-1 flex flex-col items-center justify-center text-center animate-in fade-in duration-500 p-8">
+           <div className="bg-slate-900 p-10 rounded-3xl border border-slate-800 max-w-xl w-full shadow-2xl">
+              <h2 className="text-3xl font-black text-white mb-4">Story Buffer Empty</h2>
+              <p className="text-slate-400 mb-8">
+                You've reached the end of your offline cache, or your time limit was reached. Select how much more story to generate before going offline again.
+              </p>
+
+              <div className="flex gap-4 mb-8 justify-center">
+                 {[1, 2, 5].map(size => (
+                   <button
+                     key={size}
+                     onClick={() => setGenerationSize(size as GenerationSize)}
+                     className={`px-6 py-3 rounded-2xl border-2 font-bold transition-all ${
+                       generationSize === size
+                         ? 'border-indigo-500 bg-indigo-500/20 text-indigo-300'
+                         : 'border-slate-700 bg-slate-800 text-slate-400 hover:bg-slate-700'
+                     }`}
+                   >
+                     {size} Minute{size > 1 ? 's' : ''}
+                   </button>
+                 ))}
+              </div>
+
+              {error && (
+                <div className="bg-rose-500/10 border border-rose-500/30 text-rose-400 p-4 rounded-xl flex items-center gap-3 w-full text-left mb-6">
+                  <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                  <p className="text-sm">{error}</p>
+                </div>
+              )}
+
+              <div className="flex flex-col sm:flex-row items-center gap-4 justify-center">
+                 <button
+                   onClick={() => generateStory(true)}
+                   className="flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-4 rounded-full font-bold text-lg transition-all w-full sm:w-auto shadow-lg shadow-indigo-600/30"
+                 >
+                   <Wifi className="w-5 h-5" /> Generate More Story
+                 </button>
+                 <button
+                   onClick={stopGame}
+                   className="text-slate-500 hover:text-white transition-colors font-bold px-6 py-4"
+                 >
+                   End Game
+                 </button>
+              </div>
+           </div>
+        </div>
+      )}
+
       {gameState === 'playing' && currentNode && (
         <div className="max-w-3xl mx-auto w-full flex-1 flex flex-col animate-in slide-in-from-bottom-8 duration-700">
            
-           <header className="flex items-center justify-between py-6 border-b border-slate-800 mb-8">
-              <div className="flex items-center gap-3">
-                 <div className="bg-green-500/10 text-green-400 px-3 py-1.5 rounded-full text-xs font-bold uppercase tracking-widest flex items-center gap-2 border border-green-500/30">
-                    <WifiOff className="w-4 h-4" /> Offline Ready
+           <header className="py-6 mb-4">
+              <div className="flex items-center justify-between mb-4">
+                 <div className="flex items-center gap-3">
+                    <div className="bg-green-500/10 text-green-400 px-3 py-1.5 rounded-full text-xs font-bold uppercase tracking-widest flex items-center gap-2 border border-green-500/30">
+                       <WifiOff className="w-4 h-4" /> Offline Ready
+                    </div>
+                    <span className="text-slate-500 font-medium">|</span>
+                    <span className="text-slate-400 font-bold">{storyData?.title || selectedSetting.title}</span>
                  </div>
-                 <span className="text-slate-500 font-medium">|</span>
-                 <span className="text-slate-400 font-bold">{storyData?.title || selectedSetting.title}</span>
+                 <button onClick={stopGame} className="text-slate-500 hover:text-white transition-colors text-sm font-bold uppercase tracking-wider">
+                   End Story
+                 </button>
               </div>
-              <button onClick={stopGame} className="text-slate-500 hover:text-white transition-colors text-sm font-bold uppercase tracking-wider">
-                End Story
-              </button>
+
+              {/* Progress Bar */}
+              <div className="w-full bg-slate-900 border border-slate-800 h-2 rounded-full overflow-hidden">
+                <div 
+                  className="bg-indigo-500 h-full transition-all duration-700 ease-in-out"
+                  style={{ width: `${(decisionCount / getMaxDecisions(generationSize)) * 100}%` }}
+                />
+              </div>
+              <div className="text-right mt-2 text-xs text-slate-500 font-medium tracking-wide">
+                Buffer: {decisionCount} / {getMaxDecisions(generationSize)} Decisions
+              </div>
            </header>
 
            <div className="flex-1 flex flex-col justify-center">
@@ -388,7 +542,7 @@ export default function App() {
                   {currentNode.choices?.map((choice, i) => (
                     <button 
                       key={i}
-                      onClick={() => handleChoiceClick(choice.nextNodeId)}
+                      onClick={() => handleChoiceClick(choice.nextNodeId, choice.text)}
                       className="group relative bg-slate-900 border border-slate-700 hover:border-indigo-500 hover:bg-slate-800 p-6 rounded-3xl text-left transition-all active:scale-[0.98]"
                     >
                        <div className="text-indigo-400 text-sm font-bold uppercase tracking-widest mb-2 flex items-center gap-2">
