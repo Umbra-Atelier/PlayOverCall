@@ -247,7 +247,18 @@ export default function App() {
       setPendingChoice(null);
       setGameState('playing');
     } catch (err: any) {
-      setError(err.message + " (Check your API key or network connection).");
+      console.error("Generation Error:", err);
+      let errorMessage = err.message || "An unknown error occurred.";
+      
+      if (errorMessage.includes("503") || errorMessage.includes("high demand") || errorMessage.includes("UNAVAILABLE")) {
+         errorMessage = "The AI is currently experiencing high demand. Please try again in a few moments.";
+      } else if (errorMessage.includes("API key") || errorMessage.includes("400") || errorMessage.includes("403")) {
+         errorMessage = "There was an issue with your API Key. Please check your settings and try again.";
+      } else {
+         errorMessage = errorMessage + " (Please check your API key or network connection).";
+      }
+      
+      setError(errorMessage);
       setGameState(isContinue ? 'generate_more' : 'menu');
     }
   };
